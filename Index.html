@@ -1,0 +1,182 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.37;
+
+contract NexusContentSubscriptionHub {
+    struct ContentTier {
+        address payable creator;
+        uint256 pricePerMonthWei;
+        bool isActive;
+        bytes32 contentHash;
+    }
+
+    address payable public immutable hubAdmin;
+    string public hubDescriptor;
+    uint256 public platformFeeBps; // 250 = 2.5%
+    uint256 public tierCounter;
+    uint256 public accumulatedFees;
+    bool public isHubPaused;
+
+    mapping(address => bool) public approvedCreators;
+    mapping(uint256 => ContentTier) public tiers;
+    mapping(uint256 => mapping(address => uint256)) public subscriptionExpiry;
+    mapping(address => uint256) public creatorEarnings;
+
+    event CreatorAdded(address indexed creator);
+    event SubscriptionPurchased(uint256 indexed tierId, address indexed subscriber, uint256 monthsBought, uint256 expiryTimestamp);
+    event TierCanceled(uint256 indexed tierId);
+    event TreasuryDeposited(address indexed funder, uint256 amount);
+    event TreasuryDrained(address indexed admin, uint256 amount);
+    event FeesHarvested(address indexed admin, uint256 amount);
+    event HubPauseToggled(bool isPaused);
+    event TierRegistered(uint256 indexed tierId, address indexed creator, uint256 pricePerMonth);
+    event DescriptorUpdated(string newDescriptor);
+    event EarningsWithdrawn(address indexed creator, uint256 amount);
+
+    modifier onlyAdmin() {
+        require(msg.sender == hubAdmin, "NexusSub: Access denied");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!isHubPaused, "NexusSub: Hub is paused");
+        _;
+    }
+
+    constructor() {
+        hubAdmin = payable(msg.sender);
+        hubDescriptor = "Nexus Base Content Subscription Hub v1";
+        platformFeeBps = 250; // 2.5%
+        isHubPaused = false;
+        approvedCreators[msg.sender] = true;
+    }
+
+    // 1. addCreatorProfile
+    function addCreatorProfile(address creator) external onlyAdmin {
+        require(!approvedCreators[creator], "NexusSub: Already approved");
+        approvedCreators[creator] = true;
+        emit CreatorAdded(creator);
+    }
+
+    // 2. buySubscriptionPass
+    function buySubscriptionPass(uint256 tierId, uint256 monthsToBuy) external payable whenNotPaused {
+        ContentTier storage t = tiers[tierId];
+        require(tierId > 0 && tierId <= tierCounter, "NexusSub: Invalid tier ID");
+        require(t.isActive, "NexusSub: Tier is inactive");
+        require(monthsToBuy > 0, "NexusSub: Minimum 1 month");
+
+        uint256 totalCost = t.pricePerMonthWei * monthsToBuy;
+        require(msg.value >= totalCost, "NexusSub: Insufficient payment");
+
+        uint256 fee = (msg.value * platformFeeBps) / 10000;
+        uint256 creatorShare = msg.value - fee;
+
+        accumulatedFees += fee;
+        creatorEarnings[t.creator] += creatorShare;
+
+        uint256 currentExpiry = subscriptionExpiry[tierId][msg.sender];
+        if (currentExpiry < block.timestamp) {
+            currentExpiry = block.timestamp;
+        }
+        
+        // 1 month = 30 days = 2592000 seconds
+        uint256 newExpiry = currentExpiry + (monthsToBuy * 2592000);
+        subscriptionExpiry[tierId][msg.sender] = newExpiry;
+
+        emit SubscriptionPurchased(tierId, msg.sender, monthsToBuy, newExpiry);
+    }
+
+    // 3. cancelSubscriptionTier
+    function cancelSubscriptionTier(uint256 tierId) external {
+        ContentTier storage t = tiers[tierId];
+        require(tierId > 0 && tierId <= tierCounter, "NexusSub: Invalid tier ID");
+        require(msg.sender == t.creator || msg.sender == hubAdmin, "NexusSub: Unauthorized");
+        require(t.isActive, "NexusSub: Already inactive");
+
+        t.isActive = false;
+        emit TierCanceled(tierId);
+    }
+
+    // 4. depositPlatformTreasury
+    function depositPlatformTreasury() external payable whenNotPaused {
+        require(msg.value > 0, "NexusSub: Zero deposit");
+        accumulatedFees += msg.value;
+        emit TreasuryDeposited(msg.sender, msg.value);
+    }
+
+    // 5. drainHubTreasury
+    function drainHubTreasury() external onlyAdmin {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "NexusSub: Zero balance");
+
+        accumulatedFees = 0;
+        (bool sent, ) = hubAdmin.call{value: balance}("");
+        require(sent, "NexusSub: Sweep failed");
+
+        emit TreasuryDrained(hubAdmin, balance);
+    }
+
+    // 6. harvestPlatformFees
+    function harvestPlatformFees() external onlyAdmin {
+        uint256 amount = accumulatedFees;
+        require(amount > 0, "NexusSub: Zero fees");
+
+        accumulatedFees = 0;
+        (bool sent, ) = hubAdmin.call{value: amount}("");
+        require(sent, "NexusSub: Harvest failed");
+
+        emit FeesHarvested(hubAdmin, amount);
+    }
+
+    // 7. pauseSubscriptionHub
+    function pauseSubscriptionHub(bool isPaused) external onlyAdmin {
+        isHubPaused = isPaused;
+        emit HubPauseToggled(isPaused);
+    }
+
+    // 8. registerContentTier
+    function registerContentTier(uint256 pricePerMonthWei, bytes32 contentHash) external whenNotPaused returns (uint256) {
+        require(approvedCreators[msg.sender], "NexusSub: Not an approved creator");
+        require(pricePerMonthWei > 0, "NexusSub: Price cannot be zero");
+
+        tierCounter++;
+        tiers[tierCounter] = ContentTier({
+            creator: payable(msg.sender),
+            pricePerMonthWei: pricePerMonthWei,
+            isActive: true,
+            contentHash: contentHash
+        });
+
+        emit TierRegistered(tierCounter, msg.sender, pricePerMonthWei);
+        return tierCounter;
+    }
+
+    // 9. updateHubDescriptor
+    function updateHubDescriptor(string calldata newDescriptor) external onlyAdmin {
+        require(bytes(newDescriptor).length > 0, "NexusSub: Empty descriptor");
+        hubDescriptor = newDescriptor;
+        emit DescriptorUpdated(newDescriptor);
+    }
+
+    // 10. withdrawCreatorEarnings
+    function withdrawCreatorEarnings() external {
+        uint256 amount = creatorEarnings[msg.sender];
+        require(amount > 0, "NexusSub: Zero earnings");
+
+        creatorEarnings[msg.sender] = 0;
+        (bool sent, ) = payable(msg.sender).call{value: amount}("");
+        require(sent, "NexusSub: Withdrawal failed");
+
+        emit EarningsWithdrawn(msg.sender, amount);
+    }
+
+    // Read-метод
+    function getTierInfo(uint256 tierId) external view returns (
+        address creator,
+        uint256 pricePerMonthWei,
+        bool isActive,
+        bytes32 contentHash
+    ) {
+        ContentTier memory t = tiers[tierId];
+        return (t.creator, t.pricePerMonthWei, t.isActive, t.contentHash);
+    }
+}
